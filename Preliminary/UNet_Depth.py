@@ -1,80 +1,136 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 from torchvision.utils import save_image
 
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+
 import os
 import random
-from PIL import Image
 
 # ------------------------------------------------
 # Dataset
 # ------------------------------------------------
 
-# Converts index using mapping
-def get_indices_from_mapping(idx, mapping):
-    offset = 0
-    for file_idx, num_items in enumerate(mapping):
-        if offset <= idx and idx < offset + num_items:
-            item_idx = idx - offset
-            return file_idx, item_idx
-    
-        offset = offset + num_items
-
-    raise IndexError(f'{__name__}: index {idx} out of range')
-
 class DepthDataset(Dataset):
     # Initializes dataset access and indexing
-    def __init__(self, image_folder, label_folder, transform):
+    def __init__(self, image_folder, action_folder, label_folder, transform):
         self.image_folder = image_folder
+        self.action_folder = action_folder
         self.label_folder = label_folder
         self.transform = transform
 
         self.image_files = sorted(os.listdir(image_folder))
+        self.action_files = sorted(os.listdir(action_folder))
         self.label_files = sorted(os.listdir(label_folder))
-
-        # Assumes image_files and label_files are the same length
-        self.timestep_mapping = []
-        for file in self.image_files:
-            data = np.load(os.path.join(self.image_folder, file), allow_pickle=True)
-            payload = data.item()
-
-            self.timestep_mapping.append(len(payload['depth']))
-
-        self.total_timesteps = sum(self.timestep_mapping)
 
     # Gets total number of data items
     def __len__(self):
-        return self.total_timesteps
+        return len(self.image_files)
 
     # Gets item at index
     def __getitem__(self, idx):
-        file_idx, time_idx = get_indices_from_mapping(idx, self.timestep_mapping)
+        image_file = os.path.join(self.image_folder, self.image_files[idx])
+        action_file = os.path.join(self.action_folder, self.action_files[idx])
+        label_file = os.path.join(self.label_folder, self.label_files[idx])
 
-        image_file = os.path.join(self.image_folder, self.image_files[file_idx])
-        label_file = os.path.join(self.label_folder, self.label_files[file_idx])
-
-        image_data = np.load(image_file, allow_pickle=True)
-        image_payload = image_data.item()
-        image = image_payload['depth'][time_idx]
-
-        label_data = np.load(label_file, allow_pickle=True)
-        label_payload = label_data.item()
-        label = label_payload['depth'][time_idx]
+        image = np.load(image_file)
+        action = np.load(action_file)
+        label = np.load(label_file)
 
         if self.transform:
             image = self.transform(image)
             label = self.transform(label)
 
-        return image, label
+        action = torch.tensor(action, dtype=torch.float32)
+
+        return image, action, label
 
 
 # ------------------------------------------------
+#  FiLM Block
+#  (Feature Channels, Action Condition) -> (Modulated Feature Channels)
+# ------------------------------------------------
+
+class FiLM(nn.Module): 
+    def __init__(self, num_channels, condition_dims):
+        super().__init__()
+
+        hidden_dims = 128
+        self.mlp = nn.Sequential(
+            nn.Linear(condition_dims, hidden_dims)
+            , nn.ReLU()
+            , nn.Linear(hidden_dims, 2 * num_channels)
+        )
+
+        # Initialize final layer identity
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        # Initialize gamma = 1, beta = 0
+        with torch.no_grad():
+            self.mlp[-1].bias[:num_channels].fill_(1.0)
+
+    def forward(self, x, condition):
+        '''
+        Computes gamma, beta using an MLP
+        Returns the input layer, features modulated by: gamma * x + beta
+        
+        :x: (B, num_ch, H, W)
+        :condition: (B, cond_dims)
+
+        :return: (B, num_ch, H, W)
+        '''
+        modulation_vals = self.mlp(condition)               # modulation_vals: (B, cond_dims) -> (B, 2 * C)
+        gamma, beta = modulation_vals.chunk(2, dim=1)       # gamma, beta: (B, 2 * num_ch) -> (B, num_ch), (B, num_ch)
+
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)           # gamma: (B, num_ch) -> (B, num_ch, 1, 1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)             # beta: (B, num_ch) -> (B, num_ch, 1, 1)
+
+        return gamma * x + beta                         
+    
+# ------------------------------------------------
+#  FiLM Double Conv Block
+#  (Feature Channels, Action Condition) -> (Feature Channels)
+# ------------------------------------------------
+
+class FiLMDoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, condition_dims):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.film1 = FiLM(out_channels, condition_dims)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.film2 = FiLM(out_channels, condition_dims)
+        self.relu2 = nn.ReLU(inplace=True)
+
+    def forward(self, x, condition):
+        '''
+        Computes gamma, beta using an MLP
+        Returns the input layer, features modulated by: gamma * x + beta
+        
+        :x: (B, in_ch, H, W)
+        :condition: (B, cond_dims)
+
+        :return: (B, out_ch, H, W)
+        '''
+        x = self.conv1(x)                                   # x: (B, in_ch, H, W) -> (B, out_ch, H, W)
+        x = self.film1(x, condition)                        # x: (B, out_ch, H, W), (B, cond_dims) -> (B, out_ch, H, W)
+        x = self.relu1(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+
+        x = self.conv2(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+        x = self.film2(x, condition)                        # x: (B, out_ch, H, W), (B, cond_dims) -> (B, out_ch, H, W)
+        x = self.relu2(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+
+        return x
+
+# ------------------------------------------------
 #  UNet Model
+#  (Prior Environment, Action) -> (Next Environment)
 # ------------------------------------------------
 
 # Returns a torch.nn.Sequential double convolution block: two consecutive 3x3 conv + ReLU
@@ -87,47 +143,53 @@ def double_conv(in_channels, out_channels):
     )
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512]):
-        super(UNet, self).__init__()
+    def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512], condition_dims=128):
+        super().__init__()
 
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # --- Encoder ---
         in_ch = in_channels
         for feature in features:
             self.downs.append(double_conv(in_ch, feature))
+            self.downs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
             in_ch = feature
 
         # --- Bottleneck ---
-        self.bottleneck = double_conv(features[-1], features[-1] * 2)
+        self.bottleneck = FiLMDoubleConv(in_ch, in_ch * 2, condition_dims)
+        in_ch = in_ch * 2
 
         # --- Decoder ---
         for feature in reversed(features):
-            self.ups.append(
-                nn.ConvTranspose2d(
-                    in_channels=feature * 2,
-                    out_channels=feature,
-                    kernel_size=2,
-                    stride=2
-                )
-            )
+            self.ups.append(nn.ConvTranspose2d(in_ch, feature, kernel_size=2, stride=2))
             self.ups.append(double_conv(feature * 2, feature))
 
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+            in_ch = feature
 
-    def forward(self, x):
+        self.final_conv = nn.Conv2d(in_ch, out_channels, kernel_size=1)
+
+    def forward(self, x, condition):
+        skip_scale = 0.1
         skip_connections = []
 
         # --- Encoder ---
-        for down in self.downs:
+        for idx in range(0, len(self.downs), 2):
+            conv = self.downs[idx]
+            down = self.downs[idx + 1]
+
+            # Increase channels
+            x = conv(x)
+
+            # Store skip connection
+            skip_connections.append(x * skip_scale)
+
+            # Decrease spatial dimensions
             x = down(x)
-            skip_connections.append(x)
-            x = self.pool(x)
 
         # --- Bottleneck ---
-        x = self.bottleneck(x)
+        x = self.bottleneck(x, condition)
 
         # Reverse skip connections
         skip_connections = skip_connections[::-1]
@@ -136,20 +198,19 @@ class UNet(nn.Module):
         for idx in range(0, len(self.ups), 2):
             up = self.ups[idx]
             conv = self.ups[idx + 1]
-            # Upsample
+            
+            # Increase spatial dimensions, decrease channels for skip connection concatenation
             x = up(x)
 
+            # Concatenate skip connection (increases channels)
             skip_connection = skip_connections[idx // 2]
-            if x.shape != skip_connection.shape:
-                diffY = skip_connection.size()[2] - x.size()[2]
-                diffX = skip_connection.size()[3] - x.size()[3]
-                skip_connection = skip_connection[:, :, diffY // 2 : skip_connection.size()[2] - diffY // 2,
-                                                  diffX // 2 : skip_connection.size()[3] - diffX // 2]
-
             x = torch.cat((skip_connection, x), dim=1)
+
+            # Decrease channels
             x = conv(x)
 
         x = self.final_conv(x)
+
         return x
 
 
@@ -169,7 +230,7 @@ def depth_to_png(tensor):
     return tensor
 
 # Generates num_sample random samples from the dataset, runs them through the model, and saves input, prediction, and label side by side
-def save_samples(epoch, model, dataset, device, prefix, num_samples=10, folder='output'):
+def save_samples(epoch, model, dataset, device, prefix, num_samples=10, folder='output', residual_scale=100):
     model.eval()
     os.makedirs(f'{folder}/{prefix}_epoch_{epoch + 1}', exist_ok=True)
 
@@ -178,13 +239,15 @@ def save_samples(epoch, model, dataset, device, prefix, num_samples=10, folder='
 
     with torch.no_grad():
         for i, idx in enumerate(indices):
-            image, label = dataset[idx]
+            image, action, label = dataset[idx]
             # Adds batch dimension and moves data to device
             image_batch = image.unsqueeze(0).to(device)
+            action_batch = action.unsqueeze(0).to(device)
             label_batch = label.unsqueeze(0).to(device)
 
             # Feeds input images through forward pass
-            pred_batch = model(image_batch)
+            delta = model(image_batch, action_batch) / residual_scale
+            pred_batch = image_batch + delta
 
             # Detatches batch dimension and moves data to CPU
             image_np = image_batch.squeeze(0).cpu()
@@ -228,9 +291,10 @@ def plot_loss(train_loss, test_loss):
 if __name__ == '__main__':
     # Hyperparameters
     IMG_SIZE = 64
-    BATCH_SIZE = 1
-    NUM_EPOCHS = 60
+    BATCH_SIZE = 4
+    NUM_EPOCHS = 200
     LEARNING_RATE = 1e-4
+    RESIDUAL_SCALE = 100
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -248,12 +312,13 @@ if __name__ == '__main__':
 
     # Datasets
     torch.manual_seed(0)
-    train_dataset_folder = 'preliminary_data'
-    label_dataset_folder = 'preliminary_data'
+    train_dataset_folder = 'inputs'
+    action_dataset_folder = 'actions'
+    label_dataset_folder = 'labels'
 
-    dataset = DepthDataset(train_dataset_folder, label_dataset_folder, data_transforms)
-    train_size = int(0.01 * len(dataset))
-    validation_size = int(0.985 * len(dataset))
+    dataset = DepthDataset(train_dataset_folder, action_dataset_folder, label_dataset_folder, data_transforms)
+    train_size = int(0.8 * len(dataset))
+    validation_size = int(0.0 * len(dataset))
     test_size = len(dataset) - (train_size + validation_size)
     train_dataset, validation_dataset, test_dataset = random_split(dataset, [train_size, validation_size, test_size])
 
@@ -262,7 +327,7 @@ if __name__ == '__main__':
     test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # Initialize model
-    model = UNet(in_channels=1, out_channels=1).to(device)
+    model = UNet(in_channels=1, out_channels=1, condition_dims=21).to(device)
 
     # Loss and optimizer
     criterion = nn.MSELoss()
@@ -281,25 +346,23 @@ if __name__ == '__main__':
     for epoch in range(NUM_EPOCHS):
         model.train()
         running_train_loss = 0.0
-        train_max_error = 0.0
 
-        for images, labels in train_dataloader:
+        for images, actions, labels in train_dataloader:
             images = images.to(device)
+            actions = actions.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            delta_pred = model(images, actions)
+            delta_scaled = (labels - images) * RESIDUAL_SCALE
+            loss = criterion(delta_pred, delta_scaled)
             loss.backward()
             optimizer.step()
 
             running_train_loss += loss.item()
-            error = (outputs - labels).abs()
-            train_max_error = max(train_max_error, error.max().item())
 
         epoch_train_loss = running_train_loss / len(train_dataloader)
         train_losses.append(epoch_train_loss)
-        train_max_errors.append(train_max_error)
 
         # ------------------------------------------------
         # Evaluation
@@ -311,41 +374,37 @@ if __name__ == '__main__':
         # ------------------------------------------------
         model.eval()
         running_test_loss = 0.0
-        test_max_error = 0.0
 
         with torch.no_grad():
-            for images, labels in test_dataloader:
+            for images, actions, labels in test_dataloader:
                 images = images.to(device)
+                actions = actions.to(device)
                 labels = labels.to(device)
 
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                delta_pred = model(images, actions)
+                delta_scaled = (labels - images) * RESIDUAL_SCALE
+                loss = criterion(delta_pred, delta_scaled)
 
                 running_test_loss += loss.item()
-                error = (outputs - labels).abs()
-                test_max_error = max(test_max_error, error.max().item())
 
         epoch_test_loss = running_test_loss / len(test_dataloader)
         test_losses.append(epoch_test_loss)
-        test_max_errors
 
         print(f'-- Epoch {epoch + 1} / {NUM_EPOCHS} --')
         print(f'Train Loss: {epoch_train_loss}')
-        print(f'Max Absolute Train Error: {train_max_error}')
         print(f'Test Loss: {epoch_test_loss}')
-        print(f'Max Absolute Test Error: {test_max_error}')
 
         # ------------------------------------------------
         # Generate sample images
         # ------------------------------------------------
-        # Generates 10 samples for train every 2 epochs
-        if (epoch + 1) % 2 == 0:
+        # Generates 16 samples for train every 2 epochs
+        if (epoch + 1) % 10 == 0:
             # Generate samples from training dataset
-            save_samples(epoch, model, train_dataset, device, prefix='train', num_samples=29, folder='output')
+            save_samples(epoch, model, train_dataset, device, prefix='train', num_samples=16, folder='output', residual_scale=RESIDUAL_SCALE)
 
             # Generates samples from test dataset if test set is non-empty
             if len(test_dataset) > 0:
-                save_samples(epoch, model, test_dataset, device, prefix='test', num_samples=14, folder='output')
+                save_samples(epoch, model, test_dataset, device, prefix='test', num_samples=4, folder='output', residual_scale=RESIDUAL_SCALE)
 
     # After training, plot the losses
     plot_loss(train_losses, test_losses)

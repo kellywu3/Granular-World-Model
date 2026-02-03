@@ -1,8 +1,10 @@
 import numpy as np
 
+# Prints the dimensions of each part of the preliminary dataset
+# Prints the minimum and maximum values of the depth data from each file
+
 NUM_TRIALS = 20
 
-# with open('trial1_data', 'w') as f:
 min_depths = []
 max_depths = []
 for i in range(1, NUM_TRIALS + 1):
@@ -20,18 +22,21 @@ for i in range(1, NUM_TRIALS + 1):
 
         print(f'    {key} with dimensions {dim}')
 
-    depth_image = payload['depth']
-    depth_array = depth_image.flatten()
-    rgb_image = payload['rgb']
+    depth_images = payload['depth']
+    depth_array = depth_images.flatten()
+    rgb_imagea = payload['rgb']
+    robot_states = payload['robot_state']
 
     min_depth = min(depth_array)
     max_depth = max(depth_array)
-
     min_depths.append(min_depth)
     max_depths.append(max_depth)
 
-    print(f'\n    {file_path} Depth Values')
+    print(f'\n    {file_path} Depth values')
     print(f'    Depth min: {str(min_depth)}, max: {str(max_depth)}')
+
+    print(f'\n    Robot states')
+    print(f'    {robot_states.keys()}')
 
 print(f'\nMax depth: {max(max_depths)}')
 print(f'\nMin depth: {max(min_depths)}')
