@@ -91,6 +91,7 @@ class FiLM(nn.Module):
 
         return gamma * x + beta                         
     
+
 # ------------------------------------------------
 #  FiLM Double Conv Block
 #  (Feature Channels, Action Condition) -> (Feature Channels)
@@ -108,6 +109,7 @@ class FiLMDoubleConv(nn.Module):
         self.film2 = FiLM(out_channels, condition_dims)
         self.relu2 = nn.ReLU(inplace=True)
 
+    # double convolution block w/ FiLM: two consecutive 3x3 conv + FiLM + ReLU
     def forward(self, x, condition):
         '''
         Computes gamma, beta using an MLP
@@ -128,19 +130,36 @@ class FiLMDoubleConv(nn.Module):
 
         return x
 
+
+# ------------------------------------------------
+#  Double Conv Block
+#  (Feature Channels, Action Condition) -> (Feature Channels)
+# ------------------------------------------------
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU(inplace=True)
+
+    # double convolution block: two consecutive 3x3 conv + ReLU
+    def forward(self, x):
+        x = self.conv1(x)                                   # x: (B, in_ch, H, W) -> (B, out_ch, H, W)
+        x = self.relu1(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+
+        x = self.conv2(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+        x = self.relu2(x)                                   # x: (B, out_ch, H, W) -> (B, out_ch, H, W)
+
+        return x
+
 # ------------------------------------------------
 #  UNet Model
 #  (Prior Environment, Action) -> (Next Environment)
 # ------------------------------------------------
-
-# Returns a torch.nn.Sequential double convolution block: two consecutive 3x3 conv + ReLU
-def double_conv(in_channels, out_channels):
-    return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True)
-    )
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512], condition_dims=128):
@@ -152,7 +171,7 @@ class UNet(nn.Module):
         # --- Encoder ---
         in_ch = in_channels
         for feature in features:
-            self.downs.append(double_conv(in_ch, feature))
+            self.downs.append(DoubleConv(in_ch, feature))
             self.downs.append(nn.MaxPool2d(kernel_size=2, stride=2))
 
             in_ch = feature
@@ -164,7 +183,7 @@ class UNet(nn.Module):
         # --- Decoder ---
         for feature in reversed(features):
             self.ups.append(nn.ConvTranspose2d(in_ch, feature, kernel_size=2, stride=2))
-            self.ups.append(double_conv(feature * 2, feature))
+            self.ups.append(DoubleConv(feature * 2, feature))
 
             in_ch = feature
 
@@ -223,7 +242,7 @@ def denormalize(tensor):
     return (tensor + 1.0) / 2.0
 
 # Transforms tensor for visualizing depth
-def depth_to_png(tensor):
+def convert_depth_to_png(tensor):
     tensor = tensor.clone()
     tensor = tensor - tensor.min()
     tensor = tensor / tensor.max()
@@ -240,36 +259,45 @@ def save_samples(epoch, model, dataset, device, prefix, num_samples=10, folder='
     with torch.no_grad():
         for i, idx in enumerate(indices):
             image, action, label = dataset[idx]
-            # Adds batch dimension and moves data to device
+            # Adds batch dimension, moves data to device
             image_batch = image.unsqueeze(0).to(device)
             action_batch = action.unsqueeze(0).to(device)
             label_batch = label.unsqueeze(0).to(device)
 
-            # Feeds input images through forward pass
-            delta = model(image_batch, action_batch) / residual_scale
-            pred_batch = image_batch + delta
+            # Feeds input images through forward pass to get predicted residual
+            pred_diff_batch = model(image_batch, action_batch) / residual_scale
+            # Calculates predicted image
+            pred_image_batch = image_batch + pred_diff_batch
+            # Cacluates the expected residual
+            exp_diff_batch = label_batch - image_batch
 
-            # Detatches batch dimension and moves data to CPU
+            # Removes batch dimension, moves data to CPU
             image_np = image_batch.squeeze(0).cpu()
-            pred_np = pred_batch.squeeze(0).cpu()
             label_np = label_batch.squeeze(0).cpu()
+            exp_diff_np = exp_diff_batch.squeeze(0).cpu()
+            pred_diff_np = pred_diff_batch.squeeze(0).cpu()
+            pred_image_np = pred_image_batch.squeeze(0).cpu()
 
             # Denormalizes data
             image_d  = denormalize(image_np).clamp(0, 1)
-            pred_d   = denormalize(pred_np).clamp(0, 1)
             label_d  = denormalize(label_np).clamp(0, 1)
+            exp_diff_d   = denormalize(exp_diff_np).clamp(0, 1)
+            pred_diff_d   = denormalize(pred_diff_np).clamp(0, 1)
+            pred_image_d   = denormalize(pred_image_np).clamp(0, 1)
 
             # Transforms data for visualization as a png
-            image_vis = depth_to_png(image_d)
-            pred_vis = depth_to_png(pred_d)
-            label_vis = depth_to_png(label_d)
+            image_vis = convert_depth_to_png(image_d)
+            label_vis = convert_depth_to_png(label_d)
+            exp_diff_vis = convert_depth_to_png(exp_diff_d)
+            pred_diff_vis = convert_depth_to_png(pred_diff_d)
+            pred_image_vis = convert_depth_to_png(pred_image_d)
 
             # Saves images side by side
-            images_to_save = torch.stack([image_vis, pred_vis, label_vis], dim=0) 
+            images_to_save = torch.stack([image_vis, label_vis, exp_diff_vis, pred_diff_vis, pred_image_vis], dim=0) 
             save_path = f'{folder}/{prefix}_epoch_{epoch + 1}/sample_{i}.png'
 
             # Creates grid and saves images with nrow images per row -> (input, pred, label)
-            save_image(images_to_save, save_path, nrow=3)
+            save_image(images_to_save, save_path, nrow=5)
 
 # Plots the losses for each epoch
 def plot_loss(train_loss, test_loss):
